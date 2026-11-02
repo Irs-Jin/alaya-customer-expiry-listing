@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Customer Expiry Listing - Alaya</title>
+  <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <!-- daisyUI 5 + Tailwind 4 from CDN (no build step). Tailwind's browser build compiles classes at runtime,
+       including the ones this page adds from JS. ponytail: pre-compile to a static CSS file if the CDN is ever blocked. -->
+  <link href="https://cdn.jsdelivr.net/npm/daisyui@5" rel="stylesheet" type="text/css" />
+  <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+  <style>
+    html[data-theme=light] { --color-primary: #2563eb; --color-primary-content: #fff; }
+    body { font-family: 'Inter', -apple-system, 'Segoe UI', Arial, sans-serif; }
+    table { table-layout: fixed; }
+    td, th { overflow-wrap: anywhere; }
+    thead th { position: sticky; top: 0; z-index: 1; }
+    .rz { position: absolute; right: 0; top: 0; bottom: 0; width: 6px; cursor: col-resize; user-select: none; }
+    .rz:hover, .rz.on { background: #93c5fd; }
+    @media print { tr { break-inside: avoid; } }
+  </style>
+</head>
+<body class="bg-base-200 p-4 print:bg-white print:p-0">
+<div class="card bg-base-100 shadow max-w-6xl mx-auto mb-4 print:shadow-none">
+  <div class="card-body gap-3 print:p-0">
+    <div class="print:hidden">
+      <h1 class="text-xl font-extrabold">Customer Expiry Listing</h1>
+      <div class="text-sm opacity-70 flex items-center gap-2">Customers by <b>Date Expired</b> (Customer &gt; General). Read-only.
+        <span id="badge" class="badge badge-warning badge-sm font-bold">Waiting for ALAYA_INIT...</span></div>
+    </div>
+    <div class="flex flex-wrap items-center gap-2 print:hidden">
+      <input id="q" class="input input-sm input-bordered flex-1 min-w-48" placeholder="Search account code / name / phone / email..." />
+      <select id="co" class="select select-sm select-bordered"><option value="0">All companies</option></select>
+      <label class="flex items-center gap-1 text-sm">From <input type="date" id="d-from" class="input input-sm input-bordered"></label>
+      <label class="flex items-center gap-1 text-sm">To <input type="date" id="d-to" class="input input-sm input-bordered"></label>
+      <button id="btn-load" class="btn btn-sm btn-primary" disabled>Refresh</button>
+      <button id="btn-csv" class="btn btn-sm" disabled>Export CSV</button>
+      <button id="btn-pdf" class="btn btn-sm" disabled>Export PDF</button>
+      <span id="count" class="text-sm opacity-60"></span>
+    </div>
+    <div id="print-hdr" class="hidden print:block text-sm mb-2"></div>
+    <div class="overflow-auto max-h-[520px] rounded-box border border-base-300 print:max-h-none print:overflow-visible print:border-0">
+      <table class="table table-sm w-full">
+        <thead><tr class="bg-base-200"><th class="bg-base-200" style="width:11%">Account Code</th><th class="bg-base-200" style="width:20%">Customer</th><th class="bg-base-200" style="width:10%">Phone</th><th class="bg-base-200" style="width:11%">Handphone</th><th class="bg-base-200" style="width:17%">Email</th><th class="bg-base-200" style="width:10%">Status</th><th class="bg-base-200" style="width:9%">Date Expired</th><th class="bg-base-200" style="width:12%">Days Left</th></tr></thead>
+        <tbody id="rows"><tr><td colspan="8" class="text-center opacity-60 py-6">Waiting for host...</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+<div class="card bg-base-100 shadow max-w-6xl mx-auto print:hidden"><div class="card-body py-3"><ul id="log" class="text-xs opacity-60 max-h-36 overflow-auto"></ul></div></div>
+
+<script>
+  var hostOrigin = '';
+  var pendingDcbCallbacks = {};
+  var all = [];
+  var MEMOQUERY_CB_TARGET = 'ctl00$MainContent$UserDefinedFieldModuleEditor$cbpQueryEditor$pcEditQuery$memoQuery';
+  function custSql(co) {
+    return "SELECT TOP 5000 Cust_AccountCode, Cust_NAME, Cust_Phone1, Cust_Mobile, Cust_Email, Cust_Status, " +
+      "CONVERT(varchar(10), Cust_ExpiryDate, 120) FROM Customer c WHERE Cust_ExpiryDate IS NOT NULL" +
+      (+co ? " AND EXISTS (SELECT 1 FROM CompanyCustomer cc WHERE cc.CC_CustomerID = c.Cust_ID AND cc.CC_CompanyID = " + (+co) + ")" : "") +
+      " ORDER BY Cust_ExpiryDate";
+  }
+
+  function addLog(m) { $('#log').prepend($('<li>').append($('<span class="opacity-50 mr-2">').text(new Date().toLocaleTimeString()), document.createTextNode(m))); }
+  function postToParent(type, data) { if (window.parent && window.parent !== window) window.parent.postMessage({ type: type, data: data }, '*'); }
+
+  /* ── ALAYA_INIT handshake (same as todo-list-plugin.html) ── */
+  $(window).on('message', function (e) {
+    var msg = e.originalEvent.data;
+    if (!msg || msg.type !== 'ALAYA_INIT') return;
+    hostOrigin = e.originalEvent.origin || '';
+    $('#badge').removeClass('badge-warning').addClass('badge-success').text('ALAYA_INIT received');
+    postToParent('ALAYA_READY', { status: 'ok', receivedAt: new Date().toISOString() });
+    /* pre-load hidden memoQuery iframe in host for the SQL bridge */
+    window.top.postMessage({ target: hostOrigin, eval:
+      '(function(){if(document.getElementById("hidden-memo-frame"))return;var f=document.createElement("iframe");' +
+      'f.id="hidden-memo-frame";f.style.display="none";f.src="/Modules/Maintenance/m_UserDefinedFieldModuleEditor.aspx";document.body.appendChild(f);})();'
+    }, '*');
+    $('#btn-load').prop('disabled', false);
+    loadCompanies().then(load);
+  });
+
+  /* ── host SQL bridge (verbatim from todo-list-plugin.html, Rowcount raised to 5000) ── */
+  $(window).on('message', function (e) {
+    var msg = e.originalEvent.data;
+    if (!msg || msg.source !== 'alaya-dcb-result' || !msg.requestId) return;
+    var cb = pendingDcbCallbacks[msg.requestId];
+    if (!cb) return;
+    delete pendingDcbCallbacks[msg.requestId];
+    clearTimeout(cb.timer);
+    cb.resolve(msg);
+  });
+
+  function executeSqlViaHost(sql) {
+    return new Promise(function (resolve, reject) {
+      if (!hostOrigin) { reject(new Error('ALAYA_INIT not received yet')); return; }
+      var requestId = 'dcb-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+      var timer = setTimeout(function () { delete pendingDcbCallbacks[requestId]; reject(new Error('Database callback timed out after 60s')); }, 60000);
+      pendingDcbCallbacks[requestId] = { resolve: resolve, reject: reject, timer: timer };
+      var evalScript =
+        '(function(){try{' +
+          'var sql=result.sql, reqId=result.requestId;' +
+          'function findMemoFrame(win){try{ if(typeof win.memoQuery==="object" && typeof win.WebForm_DoCallback==="function") return win; }catch(e){}' +
+            'try{ for(var i=0;i<win.frames.length;i++){ var f=findMemoFrame(win.frames[i]); if(f) return f; } }catch(e){} return null;}' +
+          'function bcast(m){function postAll(win){try{ win.postMessage(m,"*"); }catch(e){} try{ for(var i=0;i<win.frames.length;i++){ try{ postAll(win.frames[i]); }catch(e){} } }catch(e){}} postAll(window);}' +
+          'function runOnMemo(mf){var upd=""; try{ upd=mf.memoQuery.GetUpdatableTable(); }catch(e){}' +
+            'var hdr={Rowcount:5000,Timeout:0,Query:sql,UpdatableTable:(typeof upd==="string"?upd:JSON.stringify(upd))};' +
+            'var arg="RunQuery|"+JSON.stringify(hdr);' +
+            'var end=function(r){ bcast({source:"alaya-dcb-result",requestId:reqId,result:r}); };' +
+            'var err=function(ex,ctx){ bcast({source:"alaya-dcb-result",requestId:reqId,error:(ex||"").toString(),ctx:ctx}); };' +
+            'mf.WebForm_DoCallback(' + JSON.stringify(MEMOQUERY_CB_TARGET) + ', arg, end, null, err, false);}' +
+          'var mf=findMemoFrame(window); if(mf){ runOnMemo(mf); return; }' +
+          'var hidden=document.getElementById("hidden-memo-frame");' +
+          'if(!hidden){hidden=document.createElement("iframe");hidden.id="hidden-memo-frame";hidden.style.display="none";hidden.src="/Modules/Maintenance/m_UserDefinedFieldModuleEditor.aspx";document.body.appendChild(hidden);}' +
+          'var attempts=0;function poll(){attempts++;' +
+            'try{ if(hidden.contentWindow && typeof hidden.contentWindow.memoQuery==="object" && typeof hidden.contentWindow.WebForm_DoCallback==="function"){ runOnMemo(hidden.contentWindow); return; } }catch(e){}' +
+            'if(attempts<40){ setTimeout(poll,500); } else { bcast({source:"alaya-dcb-result",requestId:reqId,error:"memoQuery not available after 20s"}); }}' +
+          'poll();' +
+        '}catch(e){ bcast({source:"alaya-dcb-result",requestId:result.requestId,error:e.message}); }})();';
+      window.top.postMessage({ target: hostOrigin, eval: evalScript, sql: sql, requestId: requestId }, '*');
+    });
+  }
+
+  function rowsOf(msg) {
+    if (msg.error) throw new Error(msg.error);
+    var r = typeof msg.result === 'string' ? JSON.parse(msg.result) : msg.result;
+    if (!r || !r.success) throw new Error('Query failed: ' + JSON.stringify(r).slice(0, 200));
+    return (r.results && r.results[0] && r.results[0].rows) || [];
+  }
+
+  function loadCompanies() {
+    return executeSqlViaHost('SELECT CO_ID, CO_Name FROM Company ORDER BY CO_Name').then(function (m) {
+      rowsOf(m).forEach(function (r) { $('#co').append($('<option>').val(r[0]).text(r[1])); });
+    }).catch(function (e) { addLog('Company list failed: ' + e.message); });
+  }
+
+  /* ── load + render ── */
+  function load() {
+    $('#btn-load').prop('disabled', true);
+    $('#rows').html('<tr><td colspan="8" class="text-center opacity-60 py-6">Loading...</td></tr>');
+    executeSqlViaHost(custSql($('#co').val())).then(function (msg) {
+      all = rowsOf(msg);
+      addLog('Loaded ' + all.length + ' customers with expiry date');
+      render();
+    }).catch(function (err) {
+      addLog('Load failed: ' + err.message);
+      $('#rows').html('<tr><td colspan="8" class="text-center opacity-60 py-6">Load failed: ' + $('<i>').text(err.message).html() + '</td></tr>');
+    }).then(function () { $('#btn-load').prop('disabled', false); });
+  }
+
+  function daysLeft(s) {
+    var p = String(s).split('-');
+    var d = new Date(+p[0], +p[1] - 1, +p[2]), t = new Date(); t.setHours(0, 0, 0, 0);
+    return Math.round((d - t) / 86400000);
+  }
+
+  var view = [];
+  function render() {
+    var from = $('#d-from').val(), to = $('#d-to').val(), q = $('#q').val().toLowerCase();
+    view = all.filter(function (r) {
+      if ((from && r[6] < from) || (to && r[6] > to)) return false; // ISO yyyy-mm-dd compares as text
+      return !q || r.slice(0, 5).join(' ').toLowerCase().indexOf(q) >= 0;
+    }).map(function (r) { return r.concat([daysLeft(r[6])]); });
+    $('#count').text(view.length + ' of ' + all.length);
+    $('#btn-csv, #btn-pdf').prop('disabled', !view.length);
+    if (!view.length) { $('#rows').html('<tr><td colspan="8" class="text-center opacity-60 py-6">No customers match.</td></tr>'); return; }
+    $('#rows').empty().append(view.map(function (r) {
+      var d = r[7], cls = d < 0 ? 'badge-error' : d <= 30 ? 'badge-warning' : 'badge-success';
+      var tr = $('<tr>');
+      [r[0], r[1], r[2], r[3], r[4], r[5], r[6]].forEach(function (v) { tr.append($('<td>').text(v == null ? '' : v)); });
+      return tr.append($('<td>').append($('<span class="badge badge-soft badge-sm font-bold whitespace-nowrap ' + cls + '">').text(d < 0 ? 'Expired ' + (-d) + 'd' : d + 'd')));
+    }));
+  }
+
+  /* drag a header edge to resize that column; table grows, wrapper scrolls sideways */
+  $('th').each(function () {
+    var th = $(this), h = $('<span class="rz print:hidden">').appendTo(th);
+    h.on('mousedown', function (e) {
+      e.preventDefault();
+      var $t = $('table'), ths = $t.find('th');
+      ths.each(function () { $(this).css('width', $(this).outerWidth()); });
+      $t.css('width', ths.toArray().reduce(function (a, x) { return a + $(x).outerWidth(); }, 0));
+      var x0 = e.pageX, w0 = th.outerWidth(), t0 = $t.outerWidth();
+      h.addClass('on');
+      $(document).on('mousemove.rz', function (m) {
+        var w = Math.max(50, w0 + m.pageX - x0);
+        th.css('width', w); $t.css('width', t0 + w - w0);
+      }).on('mouseup.rz', function () { h.removeClass('on'); $(document).off('.rz'); });
+    });
+  });
+  $('#q').on('input', render);
+  $('#d-from, #d-to').on('change', render);
+  $('#co').on('change', load);
+  $('#btn-load').on('click', load);
+  $('#btn-pdf').on('click', function () {
+    $('#print-hdr').text('Customer Expiry Listing — ' + $('#co option:selected').text() +
+      ' | From ' + ($('#d-from').val() || 'any') + ' To ' + ($('#d-to').val() || 'any') +
+      ' | ' + view.length + ' customers | Printed ' + new Date().toLocaleString());
+    window.print();
+  });
+  $('#btn-csv').on('click', function () {
+    var esc = function (v) { return '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"'; };
+    var csv = [['Account Code', 'Customer', 'Phone', 'Handphone', 'Email', 'Status', 'Date Expired', 'Days Left']].concat(view)
+      .map(function (r) { return r.map(esc).join(','); }).join('\r\n');
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob(['﻿' + csv], { type: 'text/csv' }));
+    a.download = 'customer_expiry_' + new Date().toISOString().slice(0, 10) + '.csv';
+    a.click();
+  });
+  /* default range = this month (local dates, not toISOString which shifts by timezone) */
+  (function () {
+    var n = new Date(), pad = function (v) { return String(v).padStart(2, '0'); };
+    var ym = n.getFullYear() + '-' + pad(n.getMonth() + 1) + '-';
+    $('#d-from').val(ym + '01');
+    $('#d-to').val(ym + pad(new Date(n.getFullYear(), n.getMonth() + 1, 0).getDate()));
+  })();
+  addLog('Page loaded - listening for ALAYA_INIT');
+</script>
+</body>
+</html>
